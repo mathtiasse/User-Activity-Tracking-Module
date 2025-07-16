@@ -141,8 +141,9 @@ window.initActivityTracking = function(userConfig) {
         isNewSource = true;
         currentUserId.visit.source = currentSource;
       }
+      currentUserId.lastActivity = now;
+      currentUserId.visit.expirationDate = now + config.visitIdExpirationTime;
     }
-    currentUserId.lastActivity = now;
   }
 
   setInStorage("userActivity", currentUserId);
