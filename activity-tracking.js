@@ -8,6 +8,10 @@ const defaultConfig = {
   visitEngagementDelay: 10000,
   sourceParams: ["utm_source", "utm_medium", "utm_campaign", "utm_id", "utm_term", "utm_content"],
   trackSpaPages: true,
+  trackWebVitals: true,
+  enableErrorTracking: true,
+  detectAdblock: true,
+  scrollTrackingThresholds: [10, 25, 50, 75, 100],
   autoTagging: true,
   connectors: ["gtm"]
 };
@@ -57,7 +61,7 @@ window.ActivityTracking.init = function(userConfig) {
         id: generateUUID(),
         expirationDate: now + config.visitIdExpirationTime,
         landingPage,
-        source: currentSource,
+        source: JSON.parse(JSON.stringify(currentSource)),
         count: 1,
         isEngaged: false
       }
@@ -70,14 +74,14 @@ window.ActivityTracking.init = function(userConfig) {
         id: generateUUID(),
         expirationDate: now + config.visitIdExpirationTime,
         landingPage,
-        source: currentSource,
+        source: JSON.parse(JSON.stringify(currentSource)),
         count: (currentUserId.visit?.count || 0) + 1,
         isEngaged: false
       };
     } else {
       if (isValidNewSource(currentSource) && sourcesAreDifferent(previousSource, currentSource)) {
         isNewSource = true;
-        currentUserId.visit.source = currentSource;
+        currentUserId.visit.source = JSON.parse(JSON.stringify(currentSource));
       }
       currentUserId.lastActivity = now;
       currentUserId.visit.expirationDate = now + config.visitIdExpirationTime;
@@ -106,10 +110,16 @@ window.ActivityTracking.init = function(userConfig) {
     }
 
     if (isNewVisit) {
-      sendEventToConnectors({
+      const visitStartPayload = {
         event: "visit_start",
-        userActivity: currentUserId
-      });
+        userActivity: JSON.parse(JSON.stringify(currentUserId))
+      };
+
+      if (config.detectAdblock) {
+        visitStartPayload.is_adblock = detectAdblock();
+      }
+
+      sendEventToConnectors(visitStartPayload);
 
       setTimeout(() => {
         const updated = getFromStorage("userActivity");
@@ -135,6 +145,15 @@ window.ActivityTracking.init = function(userConfig) {
         event: "new_visit_source",
         userActivity: currentUserId
       });
+    }
+    if (Array.isArray(config.scrollTrackingThresholds) && config.scrollTrackingThresholds.length > 0) {
+      setupScrollTracking(config.scrollTrackingThresholds);
+    }
+    if (config.trackWebVitals) {
+      trackWebVitals();
+    }
+    if (config.enableErrorTracking) {
+      setupErrorTracking();
     }
   };
 
@@ -250,6 +269,220 @@ window.ActivityTracking.init = function(userConfig) {
     document.cookie = name + "=" + encodeURIComponent(value) + expires + "; path=/";
   }
 
+  function detectAdblock() {
+    try {
+      const bait = document.createElement("div");
+      bait.innerHTML = "&nbsp;";
+      bait.className = "pub_300x250 pub_728x90 text-ad textAd text_ad text_ads ad-banner adsbox ad-slot";
+      bait.style.cssText = "width:1px!important;height:1px!important;position:absolute!important;left:-9999px!important;top:-9999px!important;";
+
+      document.body.appendChild(bait);
+
+      const isBlocked =
+        bait.offsetHeight === 0 ||
+        bait.clientHeight === 0 ||
+        bait.offsetParent === null;
+
+      if (!isBlocked && window.getComputedStyle) {
+        const style = getComputedStyle(bait);
+        if (
+          style.display === "none" ||
+          style.visibility === "hidden" ||
+          style.opacity === "0"
+        ) {
+          document.body.removeChild(bait);
+          return true;
+        }
+      }
+
+      document.body.removeChild(bait);
+      return isBlocked;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function setupErrorTracking() {
+    const sentErrors = new Set();
+
+    function hashError(data) {
+      return [
+        data.message,
+        data.source || "",
+        data.stack || "",
+        data.lineno || "",
+        data.colno || "",
+        data.type
+      ].join("||");
+    }
+
+    function trackError(data) {
+      const hash = hashError(data);
+      if (sentErrors.has(hash)) return;
+      sentErrors.add(hash);
+
+      window.ActivityTracking.sendEvent("js_error", {
+        error: data
+      });
+    }
+
+    window.addEventListener("error", function(event) {
+      const errorData = {
+        message: event.message || null,
+        source: event.filename || null,
+        lineno: event.lineno || null,
+        colno: event.colno || null,
+        stack: event.error?.stack || null,
+        type: "js_error"
+      };
+      trackError(errorData);
+    });
+
+    window.addEventListener("unhandledrejection", function(event) {
+      const reason = event.reason || {};
+      const errorData = {
+        message: reason.message || reason.toString() || null,
+        stack: reason.stack || null,
+        type: "promise_rejection"
+      };
+      trackError(errorData);
+    });
+  }
+
+  function setupScrollTracking(thresholds) {
+    const firedThresholds = {};
+    thresholds.forEach(p => {
+      firedThresholds[p] = false;
+    });
+
+    function onScroll() {
+      const scrollTop = window.scrollY || window.pageYOffset;
+      const windowHeight = window.innerHeight;
+      const fullHeight = Math.max(
+        document.body.scrollHeight,
+        document.documentElement.scrollHeight,
+        document.body.offsetHeight,
+        document.documentElement.offsetHeight,
+        document.body.clientHeight,
+        document.documentElement.clientHeight
+      );
+
+      const scrollPercent = Math.min(100, Math.round((scrollTop + windowHeight) / fullHeight * 100));
+
+      thresholds.forEach(percent => {
+        if (!firedThresholds[percent] && scrollPercent >= percent) {
+          firedThresholds[percent] = true;
+          window.ActivityTracking.sendEvent("scroll_depth", {
+            scroll_percent: percent
+          });
+        }
+      });
+    }
+
+    window.addEventListener("scroll", throttle(onScroll, 200));
+  }
+
+  function throttle(fn, wait) {
+    let last = 0;
+    return function(...args) {
+      const now = Date.now();
+      if (now - last >= wait) {
+        last = now;
+        fn.apply(this, args);
+      }
+    };
+  }
+
+  function trackWebVitals() {
+    const vitalsStore = {
+      LCP: null,
+      CLS: null,
+      INP: null
+    };
+
+    let sent = false;
+
+    const sendSummary = () => {
+      if (sent) return;
+      sent = true;
+
+      const hasData = Object.values(vitalsStore).some(v => v !== null);
+      if (!hasData) return;
+
+      const summary = {
+        lcp: {
+          value: vitalsStore.LCP,
+          rating: vitalsStore.LCP_rating
+        },
+        cls: {
+          value: vitalsStore.CLS,
+          rating: vitalsStore.CLS_rating
+        },
+        inp: {
+          value: vitalsStore.INP,
+          rating: vitalsStore.INP_rating
+        }
+      };
+
+      window.ActivityTracking.sendEvent("web_vitals_summary", summary);
+    };
+
+    const loadWebVitals = () => {
+      if (window.webVitals) return Promise.resolve();
+      return new Promise((resolve, reject) => {
+        const script = document.createElement("script");
+        script.src = "https://unpkg.com/web-vitals@3/dist/web-vitals.iife.js";
+        script.onload = resolve;
+        script.onerror = reject;
+        document.head.appendChild(script);
+      });
+    };
+
+    const startTracking = () => {
+      const {
+        getCLS,
+        getLCP,
+        getINP
+      } = window.webVitals;
+
+      getLCP((metric) => {
+        vitalsStore.LCP = Math.round(metric.value);
+        vitalsStore.LCP_rating = metric.rating;
+      });
+
+      getCLS((metric) => {
+        vitalsStore.CLS = Math.round(metric.value * 1000) / 1000;
+        vitalsStore.CLS_rating = metric.rating;
+      }, {
+        reportAllChanges: true
+      });
+
+      getINP((metric) => {
+        vitalsStore.INP = Math.round(metric.value);
+        vitalsStore.INP_rating = metric.rating;
+      }, {
+        reportAllChanges: true
+      });
+
+      // Send once after 10s
+      setTimeout(sendSummary, 10000);
+
+      // Or on page unload (safeguard)
+      window.addEventListener("beforeunload", sendSummary);
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "hidden") sendSummary();
+      });
+    };
+
+    if (document.readyState === "complete" || document.readyState === "interactive") {
+      loadWebVitals().then(startTracking);
+    } else {
+      document.addEventListener("DOMContentLoaded", () => {
+        loadWebVitals().then(startTracking);
+      });
+    }
+  }
+
   function buildSource() {
     var source = {};
     var ref = document.referrer;
@@ -356,29 +589,29 @@ window.ActivityTracking.init = function(userConfig) {
     sendEventToConnectors(Object.assign({}, baseEvent, extraData));
   };
 
-window.ActivityTracking.addActivityData = function(type, data) {
-  if (!["user", "visit"].includes(type) || typeof data !== "object") return;
+  window.ActivityTracking.addActivityData = function(type, data) {
+    if (!["user", "visit"].includes(type) || typeof data !== "object") return;
 
-  const store = getFromStorage("userActivity") || {};
-  if (type === "user") {
-    Object.assign(store, data);
-  } else if (type === "visit") {
-    store.visit = store.visit || {};
-    Object.assign(store.visit, data);
-  }
-  setInStorage("userActivity", store);
-};
+    const store = getFromStorage("userActivity") || {};
+    if (type === "user") {
+      Object.assign(store, data);
+    } else if (type === "visit") {
+      store.visit = store.visit || {};
+      Object.assign(store.visit, data);
+    }
+    setInStorage("userActivity", store);
+  };
 
-window.ActivityTracking.deleteActivityData = function(type, key) {
-  if (!["user", "visit"].includes(type) || !key) return;
+  window.ActivityTracking.deleteActivityData = function(type, key) {
+    if (!["user", "visit"].includes(type) || !key) return;
 
-  const store = getFromStorage("userActivity") || {};
-  if (type === "user" && store.hasOwnProperty(key)) {
-    delete store[key];
-  } else if (type === "visit" && store.visit && store.visit.hasOwnProperty(key)) {
-    delete store.visit[key];
-  }
-  setInStorage("userActivity", store);
-};
+    const store = getFromStorage("userActivity") || {};
+    if (type === "user" && store.hasOwnProperty(key)) {
+      delete store[key];
+    } else if (type === "visit" && store.visit && store.visit.hasOwnProperty(key)) {
+      delete store.visit[key];
+    }
+    setInStorage("userActivity", store);
+  };
 
 };
